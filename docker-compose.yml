@@ -1,0 +1,277 @@
+name: data-lake-trino-stack
+
+services:
+  minio:
+    container_name: minio
+    hostname: minio
+    image: minio/minio:latest
+    pull_policy: always
+    ports:
+      - '9000:9000'
+      - '9001:9001'
+    volumes:
+      - "${MINIO_VOLUME_DIR:-./volume/minio-data/}:/data"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:-minioadmin}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-minioadmin}"
+      MINIO_DEFAULT_BUCKETS: "${MINIO_DEFAULT_BUCKETS:-bucket_name}"
+    command: ["server", "/data", "--console-address", ":9001"]
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9001" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      data-stack-network:
+        aliases:
+          - warehouse.minio
+
+
+  prepare_buckets:
+    container_name: minio-setup
+    image: quay.io/minio/mc:latest
+    pull_policy: always
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+    entrypoint:
+      - "/bin/sh"
+      - "-c"
+      - "-e"
+      - |
+        until mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} 2>/dev/null; do
+          sleep 0.5
+        done
+        mc admin info local
+        mc mb --ignore-existing local/tmp
+        mc mb --ignore-existing local/warehouse
+        mc mb --ignore-existing local/trino
+        mc mb --ignore-existing local/kestra
+        mc anonymous set public local/warehouse
+        mc anonymous set public local/tmp
+        mc admin user add local ${S3_LAKEKEEPER_USER} ${S3_LAKEKEEPER_PASSWORD}  || true
+        mc admin policy attach local readwrite --user ${S3_LAKEKEEPER_USER}      || true
+        mc admin user add local ${S3_TRINO_USER} ${S3_TRINO_PASSWORD}            || true
+        mc admin policy attach local readwrite --user ${S3_TRINO_USER}           || true
+        echo "MinIO bootstrap finished"
+    networks:
+      - data-stack-network
+
+  lakekeeper:
+    image: &lakekeeper-image quay.io/lakekeeper/catalog:v0-arm64
+    pull_policy: always
+    container_name: lakekeeper
+    hostname: lakekeeper
+    environment: &lakekeeper-environment
+      - LAKEKEEPER__METRICS_PORT=20002
+      - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
+      - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://${LAKEKEEPER_DB_USER}:${LAKEKEEPER_DB_PASSWORD}@postgres:5432/lakekeeper
+      - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://${LAKEKEEPER_DB_USER}:${LAKEKEEPER_DB_PASSWORD}@postgres:5432/lakekeeper
+      - LAKEKEEPER__AUTHZ_BACKEND=allowall
+      - RUST_LOG=trace,axum=trace,sqlx=trace,iceberg-catalog=trace
+      - LAKEKEEPER__LOG_CLOUDEVENTS=true
+      - LAKEKEEPER__WAREHOUSE__DEFAULT__URI=s3://warehouse/
+      - LAKEKEEPER__WAREHOUSE__DEFAULT__S3_ENDPOINT=http://minio:9000
+      - AWS_ACCESS_KEY_ID=${S3_LAKEKEEPER_USER}
+      - AWS_SECRET_ACCESS_KEY=${S3_LAKEKEEPER_PASSWORD}
+    command: [ "serve" ]
+    healthcheck:
+      test: [ "CMD", "/home/nonroot/lakekeeper", "healthcheck" ]
+      interval: 1s
+      timeout: 10s
+      retries: 3
+      start_period: 3s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - 8181:8181
+    networks:
+      - data-stack-network
+
+  migrate:
+    image: *lakekeeper-image
+    container_name: lakekeeper_migrate
+    environment: *lakekeeper-environment
+    restart: "no"
+    command: [ "migrate" ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - data-stack-network
+
+  lakekeeper_prepare:
+    container_name: lakekeeper_prepare  
+    image: python:3.11-alpine
+    pull_policy: always
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    restart: "no"
+    volumes:
+      - ${PWD}/lakekeeper/bootstrap-lk.py:/bootstrap-lk.py
+    command: [ "/bin/sh", "-c", "pip install requests && python /bootstrap-lk.py" ]
+    networks:
+      - data-stack-network
+
+  postgres:
+    image: postgres:alpine
+    pull_policy: always
+    container_name: postgres
+    hostname: postgres
+    restart: always
+    ports:
+      - 5432:5432
+    mem_limit: 256m
+    cpus: 0.2
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-admin}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-admin}"
+      POSTGRES_DB: "${POSTGRES_DB:-postgres}"
+      POSTGRES_INITDB_ARGS: "--locale=da_DK.UTF-8"
+      LANG: da_DK.UTF-8
+      LC_ALL: da_DK.UTF-8
+      TZ: "${TZ:-Europe/Copenhagen}"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-admin} -d ${POSTGRES_DB:-postgres}" ]
+      interval: 2s
+      timeout: 30s
+      retries: 8
+    env_file:
+      - .env
+    volumes:
+      - "${POSTGRES_VOLUME_DIR:-./volume/db-data/}:/var/lib/postgresql/data"
+      - ./postgres/init-user-db.sh:/docker-entrypoint-initdb.d/init-user-db.sh:ro
+    networks:
+      - data-stack-network
+
+  trino-coordinator:
+    image: trinodb/trino:latest
+    pull_policy: always
+    hostname: trino-coordinator
+    container_name: trino-coordinator
+    ports:
+      - "8080:8080"
+    environment:
+      TRINO_LOG_LEVEL: INFO
+    volumes:
+      - ${PWD}/trino/etc/catalog:/etc/trino/catalog
+      - ${PWD}/trino/etc/node.properties:/etc/trino/node.properties:ro
+      - ${PWD}/trino/etc/jvm.config:/etc/trino/jvm.config:ro
+      - ${PWD}/trino/etc/log.properties:/etc/trino/log.properties:ro
+    command: 
+      - /bin/bash
+      - -c
+      - |
+        cat > /etc/trino/config.properties <<'EOF'
+        coordinator=true
+        node-scheduler.include-coordinator=true
+        http-server.http.port=8080
+        discovery-server.enabled=true
+        discovery.uri=http://trino-coordinator:8080
+        EOF
+        /usr/lib/trino/bin/launcher.sh run
+    depends_on:
+      postgres:
+        condition: service_healthy
+      lakekeeper:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - data-stack-network
+
+  trino-worker:
+    image: trinodb/trino:latest
+    pull_policy: always
+    hostname: trino-worker
+    container_name: trino-worker
+    environment:
+      TRINO_LOG_LEVEL: INFO
+    volumes:
+      - ${PWD}/trino/etc/catalog:/etc/trino/catalog
+      - ${PWD}/trino/etc/node.properties:/etc/trino/node.properties:ro
+      - ${PWD}/trino/etc/jvm.config:/etc/trino/jvm.config:ro
+      - ${PWD}/trino/etc/log.properties:/etc/trino/log.properties:ro
+    command:
+      - /bin/bash
+      - -c
+      - |
+        cat > /etc/trino/config.properties <<'EOF'
+        coordinator=false
+        http-server.http.port=8080
+        discovery.uri=http://trino-coordinator:8080
+        EOF
+        /usr/lib/trino/bin/launcher.sh run
+    depends_on:
+      - trino-coordinator
+    networks:
+      - data-stack-network
+
+  kestra:
+    container_name: kestra
+    hostname: kestra
+    image: kestra/kestra:v0.23.10
+    pull_policy: always
+    user: "root"
+    command: server standalone
+    volumes:
+      - "${KESTRA_VOLUME_DIR:-./volume/kestra}/data:/app/storage"
+      - "${KESTRA_VOLUME_DIR:-./volume/kestra}/kestra-wd:/tmp/kestra-wd"
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      JAVA_OPTS: "-XX:UseSVE=0"
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:5432/kestra
+            driverClassName: org.postgresql.Driver
+            username: ${KESTRA_DB_USER}
+            password: ${KESTRA_DB_PASSWORD}
+        kestra:
+          anonymousUsageReport:
+            enabled: false
+          server:
+            basicAuth:
+              enabled: false
+              username: admin@localhost
+              password: Kestra4nm
+          repository:
+            type: postgres
+          storage:
+            type: minio
+            minio:
+              endpoint: http://minio
+              port: 9000
+              accessKey: ${MINIO_ROOT_USER:-minioadmin}
+              secretKey: ${MINIO_ROOT_PASSWORD:-minioadmin}
+              region: local
+              bucket: kestra 
+          queue:
+            type: postgres
+          tasks:
+            tmpDir:
+              path: /tmp/kestra-wd/tmp
+            scripts:
+              docker:
+                volume-enabled: true
+          url: http://localhost:8080/
+    ports:
+      - "8888:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - data-stack-network
+
+networks:
+  data-stack-network:
+    driver: bridge
