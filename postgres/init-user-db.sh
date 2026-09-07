@@ -1,16 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"<<-EOSQL
-  CREATE ROLE kestra
-    WITH LOGIN
-         PASSWORD '$KESTRA_DB_PASSWORD'
-         NOSUPERUSER
-         INHERIT
-         NOCREATEDB
-         NOCREATEROLE
-         NOREPLICATION;
-
+psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
   CREATE ROLE lakekeeper
     WITH LOGIN
          PASSWORD '$LAKEKEEPER_DB_PASSWORD'
@@ -20,9 +11,18 @@ psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"<<-EOSQL
          NOCREATEROLE
          NOREPLICATION;
 
-  CREATE DATABASE kestra OWNER $KESTRA_DB_USER;
-  CREATE DATABASE lakekeeper OWNER $LAKEKEEPER_DB_USER;
+  CREATE ROLE hive
+    WITH LOGIN
+         PASSWORD '$HIVE_DB_PASSWORD'
+         NOSUPERUSER
+         INHERIT
+         NOCREATEDB
+         NOCREATEROLE
+         NOREPLICATION;
 
-  GRANT ALL PRIVILEGES ON DATABASE kestra TO $KESTRA_DB_USER;
-  GRANT ALL PRIVILEGES ON DATABASE lakekeeper TO $LAKEKEEPER_DB_USER;
+  CREATE DATABASE lakekeeper OWNER lakekeeper;
+  CREATE DATABASE metastore OWNER hive;
+
+  GRANT ALL PRIVILEGES ON DATABASE lakekeeper TO lakekeeper;
+  GRANT ALL PRIVILEGES ON DATABASE metastore TO hive;
 EOSQL
