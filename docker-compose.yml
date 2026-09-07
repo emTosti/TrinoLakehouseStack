@@ -47,7 +47,6 @@ services:
         mc mb --ignore-existing local/tmp
         mc mb --ignore-existing local/warehouse
         mc mb --ignore-existing local/trino
-        mc mb --ignore-existing local/kestra
         mc anonymous set public local/warehouse
         mc anonymous set public local/tmp
         mc admin user add local ${S3_LAKEKEEPER_USER} ${S3_LAKEKEEPER_PASSWORD}  || true
@@ -110,6 +109,9 @@ services:
     container_name: lakekeeper_prepare  
     image: python:3.11-alpine
     pull_policy: always
+    environment:
+      S3_LAKEKEEPER_USER: "${S3_LAKEKEEPER_USER}"
+      S3_LAKEKEEPER_PASSWORD: "${S3_LAKEKEEPER_PASSWORD}"
     depends_on:
       lakekeeper:
         condition: service_healthy
@@ -121,7 +123,9 @@ services:
       - data-stack-network
 
   postgres:
-    image: postgres:alpine
+    # Pinned to 17: the 18+ images hard-error on a bind mount at
+    # /var/lib/postgresql/data (this repo's ./volume/db-data convention).
+    image: postgres:17-alpine
     pull_policy: always
     container_name: postgres
     hostname: postgres
@@ -151,6 +155,44 @@ services:
     networks:
       - data-stack-network
 
+  hive-metastore:
+    build:
+      context: ./hive
+    image: data-lake-trino-stack/hive-metastore:4.0.0
+    pull_policy: build
+    container_name: hive-metastore
+    hostname: hive-metastore
+    # Postgres does an internal restart right after first-boot init scripts run;
+    # retry so schema init lands once the DB is truly ready (idempotent).
+    restart: on-failure
+    ports:
+      - "9083:9083"
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      HIVE_CUSTOM_CONF_DIR: /hive-custom-conf
+      AWS_ACCESS_KEY_ID: "${S3_TRINO_USER}"
+      AWS_SECRET_ACCESS_KEY: "${S3_TRINO_PASSWORD}"
+      AWS_REGION: local
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/metastore
+        -Djavax.jdo.option.ConnectionUserName=${HIVE_DB_USER}
+        -Djavax.jdo.option.ConnectionPassword=${HIVE_DB_PASSWORD}
+    volumes:
+      - ${PWD}/hive/conf:/hive-custom-conf:ro
+    healthcheck:
+      test: [ "CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/9083'" ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - data-stack-network
+
   trino-coordinator:
     image: trinodb/trino:latest
     pull_policy: always
@@ -160,29 +202,22 @@ services:
       - "8080:8080"
     environment:
       TRINO_LOG_LEVEL: INFO
+    env_file:
+      - .env
     volumes:
       - ${PWD}/trino/etc/catalog:/etc/trino/catalog
+      - ${PWD}/trino/etc/config.properties:/etc/trino/config.properties:ro
       - ${PWD}/trino/etc/node.properties:/etc/trino/node.properties:ro
       - ${PWD}/trino/etc/jvm.config:/etc/trino/jvm.config:ro
       - ${PWD}/trino/etc/log.properties:/etc/trino/log.properties:ro
-    command: 
-      - /bin/bash
-      - -c
-      - |
-        cat > /etc/trino/config.properties <<'EOF'
-        coordinator=true
-        node-scheduler.include-coordinator=true
-        http-server.http.port=8080
-        discovery-server.enabled=true
-        discovery.uri=http://trino-coordinator:8080
-        EOF
-        /usr/lib/trino/bin/launcher.sh run
     depends_on:
       postgres:
         condition: service_healthy
       lakekeeper:
         condition: service_healthy
       minio:
+        condition: service_healthy
+      hive-metastore:
         condition: service_healthy
     networks:
       - data-stack-network
@@ -194,81 +229,16 @@ services:
     container_name: trino-worker
     environment:
       TRINO_LOG_LEVEL: INFO
+    env_file:
+      - .env
     volumes:
       - ${PWD}/trino/etc/catalog:/etc/trino/catalog
+      - ${PWD}/trino/etc/config.properties.worker:/etc/trino/config.properties:ro
       - ${PWD}/trino/etc/node.properties:/etc/trino/node.properties:ro
       - ${PWD}/trino/etc/jvm.config:/etc/trino/jvm.config:ro
       - ${PWD}/trino/etc/log.properties:/etc/trino/log.properties:ro
-    command:
-      - /bin/bash
-      - -c
-      - |
-        cat > /etc/trino/config.properties <<'EOF'
-        coordinator=false
-        http-server.http.port=8080
-        discovery.uri=http://trino-coordinator:8080
-        EOF
-        /usr/lib/trino/bin/launcher.sh run
     depends_on:
       - trino-coordinator
-    networks:
-      - data-stack-network
-
-  kestra:
-    container_name: kestra
-    hostname: kestra
-    image: kestra/kestra:v0.23.10
-    pull_policy: always
-    user: "root"
-    command: server standalone
-    volumes:
-      - "${KESTRA_VOLUME_DIR:-./volume/kestra}/data:/app/storage"
-      - "${KESTRA_VOLUME_DIR:-./volume/kestra}/kestra-wd:/tmp/kestra-wd"
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      JAVA_OPTS: "-XX:UseSVE=0"
-      KESTRA_CONFIGURATION: |
-        datasources:
-          postgres:
-            url: jdbc:postgresql://postgres:5432/kestra
-            driverClassName: org.postgresql.Driver
-            username: ${KESTRA_DB_USER}
-            password: ${KESTRA_DB_PASSWORD}
-        kestra:
-          anonymousUsageReport:
-            enabled: false
-          server:
-            basicAuth:
-              enabled: false
-              username: admin@localhost
-              password: Kestra4nm
-          repository:
-            type: postgres
-          storage:
-            type: minio
-            minio:
-              endpoint: http://minio
-              port: 9000
-              accessKey: ${MINIO_ROOT_USER:-minioadmin}
-              secretKey: ${MINIO_ROOT_PASSWORD:-minioadmin}
-              region: local
-              bucket: kestra 
-          queue:
-            type: postgres
-          tasks:
-            tmpDir:
-              path: /tmp/kestra-wd/tmp
-            scripts:
-              docker:
-                volume-enabled: true
-          url: http://localhost:8080/
-    ports:
-      - "8888:8080"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
     networks:
       - data-stack-network
 

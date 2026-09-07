@@ -1,6 +1,6 @@
 # Data Lake Stack - Trino Edition
 
-A federated query engine stack for exploring and analyzing data across multiple sources using Trino, including MinIO, PostgreSQL, Lakekeeper (Iceberg Catalog), and Kestra.
+A federated query engine stack for exploring and analyzing data across multiple sources using Trino, including MinIO, PostgreSQL, Lakekeeper (Iceberg Catalog), and a Hive Metastore for raw S3 tables.
 
 ---
 
@@ -11,10 +11,10 @@ A federated query engine stack for exploring and analyzing data across multiple 
 - **lakekeeper**: Iceberg catalog for managing data lake metadata and tables.
 - **migrate**: Runs Lakekeeper database migrations.
 - **lakekeeper_prepare**: Bootstraps Lakekeeper with initial configuration.
-- **postgres**: PostgreSQL database for Lakekeeper, Kestra, and Trino metadata.
+- **postgres**: PostgreSQL database backing Lakekeeper, the Hive Metastore, and available as a Trino source.
+- **hive-metastore**: Apache Hive Standalone Metastore, backing the Trino `s3` catalog for raw Parquet/ORC tables on MinIO. Its schema lives in the `metastore` Postgres database.
 - **trino-coordinator**: Trino query coordinator node - accepts queries and manages execution.
 - **trino-worker**: Trino worker node - executes distributed queries.
-- **kestra**: Workflow orchestration engine, configured to use MinIO and PostgreSQL.
 
 All services are connected via the `data-stack-network` Docker network.
 
@@ -37,7 +37,10 @@ All services are connected via the `data-stack-network` Docker network.
    Ensure you have Docker and Docker Compose installed on your machine.
 
 2. **Environment Variables**  
-   A `.env` file is already provided with default settings. Adjust as needed.
+   Copy the template and adjust as needed. `.env` is git-ignored:
+   ```bash
+   cp .env.example .env
+   ```
 
 3. **Initialize User Database**  
    Make the Postgres shell script executable:
@@ -55,7 +58,7 @@ All services are connected via the `data-stack-network` Docker network.
    - **Trino UI:** [http://localhost:8080](http://localhost:8080)  
    - **Lakekeeper:** http://localhost:8181  
    - **PostgreSQL:** localhost:5432 (admin/admin)  
-   - **Kestra:** [http://localhost:8888](http://localhost:8888)
+   - **Hive Metastore:** thrift://localhost:9083
 
 ---
 
@@ -73,10 +76,22 @@ Query tables directly from PostgreSQL:
 SELECT * FROM postgresql.public.table_name;
 ```
 
-### 3. **s3** - Raw S3 Parquet Files
-Query Parquet files directly from MinIO:
+### 3. **s3** - Raw Files on MinIO (Hive connector)
+Register a schema and external tables over Parquet/ORC data in MinIO, then query them:
 ```sql
-SELECT * FROM s3."warehouse"."path/to/file.parquet";
+CREATE SCHEMA IF NOT EXISTS s3.raw
+WITH (location = 's3://warehouse/raw/');
+
+CREATE TABLE s3.raw.my_table (
+  id     bigint,
+  name   varchar
+)
+WITH (
+  external_location = 's3://warehouse/raw/my_table/',
+  format = 'PARQUET'
+);
+
+SELECT * FROM s3.raw.my_table;
 ```
 
 ---
@@ -95,8 +110,8 @@ SELECT
 FROM iceberg.datalake.iceberg_table i
 JOIN postgresql.public.pg_table p ON i.id = p.id;
 
--- Query raw Parquet files
-SELECT * FROM s3."warehouse"."path/to/file.parquet";
+-- Query raw files registered in the Hive-backed s3 catalog
+SELECT * FROM s3.raw.my_table;
 ```
 
 ---
@@ -114,11 +129,13 @@ SELECT * FROM s3."warehouse"."path/to/file.parquet";
 ## Configuration Files
 
 - **docker-compose.yml** - Service definitions and networking
-- **.env** - Environment variables and credentials
-- **postgres/init-user-db.sh** - PostgreSQL initialization
+- **.env.example** - Template for `.env` (environment variables and credentials); `.env` is git-ignored
+- **postgres/init-user-db.sh** - PostgreSQL initialization (creates the `lakekeeper` and `metastore` databases)
 - **lakekeeper/bootstrap-lk.py** - Lakekeeper setup script
-- **trino/etc/config.properties** - Coordinator configuration
-- **trino/etc/catalog/*.properties** - Data source connectors (Iceberg, PostgreSQL, S3)
+- **hive/Dockerfile** - Hive Metastore image, extended with the PostgreSQL JDBC driver
+- **trino/etc/config.properties** - Coordinator configuration (`config.properties.worker` for workers)
+- **trino/etc/node.properties**, **jvm.config**, **log.properties** - Trino node configuration
+- **trino/etc/catalog/*.properties** - Data source connectors (Iceberg, PostgreSQL, S3/Hive)
 
 ---
 

@@ -1,5 +1,9 @@
+import os
 import time
 import requests
+
+S3_ACCESS_KEY = os.environ.get("S3_LAKEKEEPER_USER", "lakekeeper")
+S3_SECRET_KEY = os.environ.get("S3_LAKEKEEPER_PASSWORD", "LKpassw0rd!")
 
 
 def init_lk():
@@ -31,7 +35,6 @@ def init_lk():
                 "type": "s3",
                 "bucket": "warehouse",
                 "key-prefix": "datalake-warehouse",
-                "assume-role-arn": "null",
                 "endpoint": "http://minio:9000",
                 "region": "local",
                 "path-style-access": True,
@@ -41,8 +44,8 @@ def init_lk():
             "storage-credential": {
                 "type": "s3",
                 "credential-type": "access-key",
-                "aws-access-key-id": "lakekeeper",
-                "aws-secret-access-key": "LKpassw0rd!",
+                "aws-access-key-id": S3_ACCESS_KEY,
+                "aws-secret-access-key": S3_SECRET_KEY,
             },
         },
     )
