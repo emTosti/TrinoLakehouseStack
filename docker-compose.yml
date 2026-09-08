@@ -15,16 +15,24 @@ services:
       MINIO_ROOT_USER: "${MINIO_ROOT_USER:-minioadmin}"
       MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-minioadmin}"
       MINIO_DEFAULT_BUCKETS: "${MINIO_DEFAULT_BUCKETS:-bucket_name}"
+      # Fire object-created events for the `landing` bucket at the inspector.
+      MINIO_NOTIFY_WEBHOOK_ENABLE_SCHEMAPROPOSER: "on"
+      MINIO_NOTIFY_WEBHOOK_ENDPOINT_SCHEMAPROPOSER: "http://schema-proposer:8000/minio-events"
+      MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_SCHEMAPROPOSER: "${INSPECTOR_WEBHOOK_TOKEN}"
     command: ["server", "/data", "--console-address", ":9001"]
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:9001" ]
       interval: 30s
       timeout: 10s
       retries: 5
+    depends_on:
+      schema-proposer:
+        condition: service_started
     networks:
       data-stack-network:
         aliases:
           - warehouse.minio
+      inspector-network: {}
 
 
   prepare_buckets:
@@ -47,13 +55,19 @@ services:
         mc mb --ignore-existing local/tmp
         mc mb --ignore-existing local/warehouse
         mc mb --ignore-existing local/trino
-        mc mb --ignore-existing local/kestra
+        mc mb --ignore-existing local/landing
+        mc mb --ignore-existing local/inspection-reports
         mc anonymous set public local/warehouse
         mc anonymous set public local/tmp
         mc admin user add local ${S3_LAKEKEEPER_USER} ${S3_LAKEKEEPER_PASSWORD}  || true
         mc admin policy attach local readwrite --user ${S3_LAKEKEEPER_USER}      || true
         mc admin user add local ${S3_TRINO_USER} ${S3_TRINO_PASSWORD}            || true
         mc admin policy attach local readwrite --user ${S3_TRINO_USER}           || true
+        mc admin user add local ${INSPECTOR_USER} ${INSPECTOR_PASSWORD}          || true
+        printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::landing","arn:aws:s3:::landing/*"]},{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:ListBucket"],"Resource":["arn:aws:s3:::inspection-reports","arn:aws:s3:::inspection-reports/*"]}]}' > /tmp/inspector-policy.json
+        mc admin policy create local inspector-scoped /tmp/inspector-policy.json || mc admin policy add local inspector-scoped /tmp/inspector-policy.json || true
+        mc admin policy attach local inspector-scoped --user ${INSPECTOR_USER}   || true
+        mc event add local/landing arn:minio:sqs::SCHEMAPROPOSER:webhook --event put --quiet || true
         echo "MinIO bootstrap finished"
     networks:
       - data-stack-network
@@ -110,6 +124,9 @@ services:
     container_name: lakekeeper_prepare  
     image: python:3.11-alpine
     pull_policy: always
+    environment:
+      S3_LAKEKEEPER_USER: "${S3_LAKEKEEPER_USER}"
+      S3_LAKEKEEPER_PASSWORD: "${S3_LAKEKEEPER_PASSWORD}"
     depends_on:
       lakekeeper:
         condition: service_healthy
@@ -121,7 +138,9 @@ services:
       - data-stack-network
 
   postgres:
-    image: postgres:alpine
+    # Pinned to 17: the 18+ images hard-error on a bind mount at
+    # /var/lib/postgresql/data (this repo's ./volume/db-data convention).
+    image: postgres:17-alpine
     pull_policy: always
     container_name: postgres
     hostname: postgres
@@ -151,6 +170,44 @@ services:
     networks:
       - data-stack-network
 
+  hive-metastore:
+    build:
+      context: ./hive
+    image: data-lake-trino-stack/hive-metastore:4.0.0
+    pull_policy: build
+    container_name: hive-metastore
+    hostname: hive-metastore
+    # Postgres does an internal restart right after first-boot init scripts run;
+    # retry so schema init lands once the DB is truly ready (idempotent).
+    restart: on-failure
+    ports:
+      - "9083:9083"
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      HIVE_CUSTOM_CONF_DIR: /hive-custom-conf
+      AWS_ACCESS_KEY_ID: "${S3_TRINO_USER}"
+      AWS_SECRET_ACCESS_KEY: "${S3_TRINO_PASSWORD}"
+      AWS_REGION: local
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/metastore
+        -Djavax.jdo.option.ConnectionUserName=${HIVE_DB_USER}
+        -Djavax.jdo.option.ConnectionPassword=${HIVE_DB_PASSWORD}
+    volumes:
+      - ${PWD}/hive/conf:/hive-custom-conf:ro
+    healthcheck:
+      test: [ "CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/9083'" ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - data-stack-network
+
   trino-coordinator:
     image: trinodb/trino:latest
     pull_policy: always
@@ -160,29 +217,22 @@ services:
       - "8080:8080"
     environment:
       TRINO_LOG_LEVEL: INFO
+    env_file:
+      - .env
     volumes:
       - ${PWD}/trino/etc/catalog:/etc/trino/catalog
+      - ${PWD}/trino/etc/config.properties:/etc/trino/config.properties:ro
       - ${PWD}/trino/etc/node.properties:/etc/trino/node.properties:ro
       - ${PWD}/trino/etc/jvm.config:/etc/trino/jvm.config:ro
       - ${PWD}/trino/etc/log.properties:/etc/trino/log.properties:ro
-    command: 
-      - /bin/bash
-      - -c
-      - |
-        cat > /etc/trino/config.properties <<'EOF'
-        coordinator=true
-        node-scheduler.include-coordinator=true
-        http-server.http.port=8080
-        discovery-server.enabled=true
-        discovery.uri=http://trino-coordinator:8080
-        EOF
-        /usr/lib/trino/bin/launcher.sh run
     depends_on:
       postgres:
         condition: service_healthy
       lakekeeper:
         condition: service_healthy
       minio:
+        condition: service_healthy
+      hive-metastore:
         condition: service_healthy
     networks:
       - data-stack-network
@@ -194,84 +244,56 @@ services:
     container_name: trino-worker
     environment:
       TRINO_LOG_LEVEL: INFO
+    env_file:
+      - .env
     volumes:
       - ${PWD}/trino/etc/catalog:/etc/trino/catalog
+      - ${PWD}/trino/etc/config.properties.worker:/etc/trino/config.properties:ro
       - ${PWD}/trino/etc/node.properties:/etc/trino/node.properties:ro
       - ${PWD}/trino/etc/jvm.config:/etc/trino/jvm.config:ro
       - ${PWD}/trino/etc/log.properties:/etc/trino/log.properties:ro
-    command:
-      - /bin/bash
-      - -c
-      - |
-        cat > /etc/trino/config.properties <<'EOF'
-        coordinator=false
-        http-server.http.port=8080
-        discovery.uri=http://trino-coordinator:8080
-        EOF
-        /usr/lib/trino/bin/launcher.sh run
     depends_on:
       - trino-coordinator
     networks:
       - data-stack-network
 
-  kestra:
-    container_name: kestra
-    hostname: kestra
-    image: kestra/kestra:v0.23.10
-    pull_policy: always
-    user: "root"
-    command: server standalone
-    volumes:
-      - "${KESTRA_VOLUME_DIR:-./volume/kestra}/data:/app/storage"
-      - "${KESTRA_VOLUME_DIR:-./volume/kestra}/kestra-wd:/tmp/kestra-wd"
-      - /var/run/docker.sock:/var/run/docker.sock
+  schema-proposer:
+    build:
+      context: ./inspector
+    image: data-lake-trino-stack/schema-proposer:1
+    pull_policy: build
+    container_name: schema-proposer
+    hostname: schema-proposer
+    restart: unless-stopped
+    # Hardened: it only ever handles untrusted uploads.
+    read_only: true
+    tmpfs:
+      - /tmp:size=768m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 2g
+    pids_limit: 256
     environment:
-      JAVA_OPTS: "-XX:UseSVE=0"
-      KESTRA_CONFIGURATION: |
-        datasources:
-          postgres:
-            url: jdbc:postgresql://postgres:5432/kestra
-            driverClassName: org.postgresql.Driver
-            username: ${KESTRA_DB_USER}
-            password: ${KESTRA_DB_PASSWORD}
-        kestra:
-          anonymousUsageReport:
-            enabled: false
-          server:
-            basicAuth:
-              enabled: false
-              username: admin@localhost
-              password: Kestra4nm
-          repository:
-            type: postgres
-          storage:
-            type: minio
-            minio:
-              endpoint: http://minio
-              port: 9000
-              accessKey: ${MINIO_ROOT_USER:-minioadmin}
-              secretKey: ${MINIO_ROOT_PASSWORD:-minioadmin}
-              region: local
-              bucket: kestra 
-          queue:
-            type: postgres
-          tasks:
-            tmpDir:
-              path: /tmp/kestra-wd/tmp
-            scripts:
-              docker:
-                volume-enabled: true
-          url: http://localhost:8080/
-    ports:
-      - "8888:8080"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: "${INSPECTOR_USER}"
+      S3_SECRET_KEY: "${INSPECTOR_PASSWORD}"
+      S3_REGION: local
+      LANDING_BUCKET: landing
+      REPORTS_BUCKET: inspection-reports
+      WEBHOOK_TOKEN: "${INSPECTOR_WEBHOOK_TOKEN}"
+      MAX_DOWNLOAD_BYTES: "134217728"   # 128 MiB — Parquet files above this are not inspected
+      MAX_TEXT_BYTES: "8388608"         # 8 MiB — CSV/JSON sample size
+      MAX_SAMPLE_ROWS: "1000"
+      INSPECT_TIMEOUT_SECONDS: "60"
+    # No published ports and only the inspector-network: it can reach MinIO and
+    # nothing else — not Postgres, Lakekeeper, the Hive Metastore, or Trino.
     networks:
-      - data-stack-network
+      - inspector-network
 
 networks:
   data-stack-network:
+    driver: bridge
+  inspector-network:
     driver: bridge
