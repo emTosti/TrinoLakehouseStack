@@ -157,4 +157,33 @@ postgres ─┬─> migrate (lakekeeper_migrate) ─> lakekeeper ─> lakekeeper
           └─> hive-metastore
 
 minio + postgres + lakekeeper + hive-metastore  ──(all healthy)──>  trino-coordinator ──> trino-worker
+
+schema-proposer  <──(webhook)──  minio     (isolated on inspector-network)
 ```
+
+## schema-proposer — inspecting untrusted uploads
+
+A separate, deliberately isolated service. It does **not** register data — it
+watches a bucket of untrusted uploads and produces a schema *proposal* for a
+human to review.
+
+- **`landing` bucket** — where untrusted files are uploaded. Physically separate
+  from `warehouse`. MinIO fires an `s3:ObjectCreated` webhook (with an auth
+  token) at the inspector.
+- **`schema-proposer` service** — receives the webhook, does a *bounded* ranged
+  GET of the new object, and parses it in a short-lived `spawn` subprocess with
+  `RLIMIT_CPU` + a wall-clock kill. It infers a schema (Parquet from the footer;
+  CSV/JSON from a sample), collects example values and anomaly flags, and writes
+  a Markdown + JSON proposal — including ready-to-paste DDL — to the
+  **`inspection-reports` bucket**.
+- **Isolation.** The service sits on its own `inspector-network` with only MinIO
+  reachable. Its MinIO key can read `landing` and write `inspection-reports` and
+  nothing else. It has no credentials or network route to Postgres, Lakekeeper,
+  the Hive Metastore, or Trino. The container runs read-only, non-root, with all
+  capabilities dropped and `no-new-privileges`.
+- **Nothing is applied.** A person reads the proposal and, if the data is
+  trusted, runs the DDL by hand.
+
+This fills the "new / unknown data" gap: raw files never become queryable tables
+automatically, but you get a reviewed, low-risk on-ramp for the ones that
+should. Full detail: [../inspector/README.md](../inspector/README.md).
