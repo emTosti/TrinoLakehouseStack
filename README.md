@@ -109,11 +109,16 @@ rm -rf volume/
 | Lakekeeper | http://localhost:8181 | Iceberg REST + management API |
 | PostgreSQL | `localhost:5432` | |
 | Hive Metastore | `thrift://localhost:9083` | Thrift only, no web UI |
+| schema-proposer | — (internal) | Inspects uploads to the `landing` bucket; see [inspector/README.md](inspector/README.md) |
 
 Long-running services: `minio`, `postgres`, `lakekeeper`, `hive-metastore`,
-`trino-coordinator`, `trino-worker`. One-shot jobs that exit 0 when done:
-`minio-setup` (`prepare_buckets`), `lakekeeper_migrate` (`migrate`),
-`lakekeeper_prepare`.
+`trino-coordinator`, `trino-worker`, `schema-proposer`. One-shot jobs that exit
+0 when done: `minio-setup` (`prepare_buckets`), `lakekeeper_migrate`
+(`migrate`), `lakekeeper_prepare`.
+
+MinIO buckets: `warehouse` (Iceberg + `s3` catalog data), `trino`/`tmp`
+(scratch), `landing` (untrusted uploads to inspect), `inspection-reports`
+(schema proposals).
 
 ---
 
@@ -345,6 +350,30 @@ FROM iceberg.datalake.events e
 JOIN s3.raw.pageviews p ON p.path = '/home'
 JOIN postgresql.public.users u ON u.id = e.id;
 ```
+
+---
+
+## Inspecting new / unknown data
+
+The stack never turns raw files into queryable tables automatically. Instead,
+the **`schema-proposer`** service gives you a reviewed on-ramp:
+
+1. Upload a file (Parquet, CSV/TSV, JSON/NDJSON) to the **`landing`** bucket:
+   ```bash
+   mc alias set datalake http://localhost:9000 minioadmin minioadmin
+   mc cp ./orders.parquet datalake/landing/uploads/orders/
+   ```
+2. MinIO notifies `schema-proposer`, which samples a bounded slice of the file
+   in an isolated sandbox — it **does not** register anything.
+3. Read the proposal it writes to the **`inspection-reports`** bucket:
+   ```bash
+   mc cat datalake/inspection-reports/uploads/orders/latest.md
+   ```
+   It contains a proposed schema (types, null rates, example values), a row
+   sample, anomaly flags, and ready-to-paste `CREATE TABLE` DDL.
+4. If the data is trusted, run that DDL yourself in the Trino CLI.
+
+Design and security model: [inspector/README.md](inspector/README.md).
 
 ---
 

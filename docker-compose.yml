@@ -15,16 +15,24 @@ services:
       MINIO_ROOT_USER: "${MINIO_ROOT_USER:-minioadmin}"
       MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-minioadmin}"
       MINIO_DEFAULT_BUCKETS: "${MINIO_DEFAULT_BUCKETS:-bucket_name}"
+      # Fire object-created events for the `landing` bucket at the inspector.
+      MINIO_NOTIFY_WEBHOOK_ENABLE_SCHEMAPROPOSER: "on"
+      MINIO_NOTIFY_WEBHOOK_ENDPOINT_SCHEMAPROPOSER: "http://schema-proposer:8000/minio-events"
+      MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_SCHEMAPROPOSER: "${INSPECTOR_WEBHOOK_TOKEN}"
     command: ["server", "/data", "--console-address", ":9001"]
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:9001" ]
       interval: 30s
       timeout: 10s
       retries: 5
+    depends_on:
+      schema-proposer:
+        condition: service_started
     networks:
       data-stack-network:
         aliases:
           - warehouse.minio
+      inspector-network: {}
 
 
   prepare_buckets:
@@ -47,12 +55,19 @@ services:
         mc mb --ignore-existing local/tmp
         mc mb --ignore-existing local/warehouse
         mc mb --ignore-existing local/trino
+        mc mb --ignore-existing local/landing
+        mc mb --ignore-existing local/inspection-reports
         mc anonymous set public local/warehouse
         mc anonymous set public local/tmp
         mc admin user add local ${S3_LAKEKEEPER_USER} ${S3_LAKEKEEPER_PASSWORD}  || true
         mc admin policy attach local readwrite --user ${S3_LAKEKEEPER_USER}      || true
         mc admin user add local ${S3_TRINO_USER} ${S3_TRINO_PASSWORD}            || true
         mc admin policy attach local readwrite --user ${S3_TRINO_USER}           || true
+        mc admin user add local ${INSPECTOR_USER} ${INSPECTOR_PASSWORD}          || true
+        printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::landing","arn:aws:s3:::landing/*"]},{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:ListBucket"],"Resource":["arn:aws:s3:::inspection-reports","arn:aws:s3:::inspection-reports/*"]}]}' > /tmp/inspector-policy.json
+        mc admin policy create local inspector-scoped /tmp/inspector-policy.json || mc admin policy add local inspector-scoped /tmp/inspector-policy.json || true
+        mc admin policy attach local inspector-scoped --user ${INSPECTOR_USER}   || true
+        mc event add local/landing arn:minio:sqs::SCHEMAPROPOSER:webhook --event put --quiet || true
         echo "MinIO bootstrap finished"
     networks:
       - data-stack-network
@@ -242,6 +257,43 @@ services:
     networks:
       - data-stack-network
 
+  schema-proposer:
+    build:
+      context: ./inspector
+    image: data-lake-trino-stack/schema-proposer:1
+    pull_policy: build
+    container_name: schema-proposer
+    hostname: schema-proposer
+    restart: unless-stopped
+    # Hardened: it only ever handles untrusted uploads.
+    read_only: true
+    tmpfs:
+      - /tmp:size=768m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 2g
+    pids_limit: 256
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: "${INSPECTOR_USER}"
+      S3_SECRET_KEY: "${INSPECTOR_PASSWORD}"
+      S3_REGION: local
+      LANDING_BUCKET: landing
+      REPORTS_BUCKET: inspection-reports
+      WEBHOOK_TOKEN: "${INSPECTOR_WEBHOOK_TOKEN}"
+      MAX_DOWNLOAD_BYTES: "134217728"   # 128 MiB — Parquet files above this are not inspected
+      MAX_TEXT_BYTES: "8388608"         # 8 MiB — CSV/JSON sample size
+      MAX_SAMPLE_ROWS: "1000"
+      INSPECT_TIMEOUT_SECONDS: "60"
+    # No published ports and only the inspector-network: it can reach MinIO and
+    # nothing else — not Postgres, Lakekeeper, the Hive Metastore, or Trino.
+    networks:
+      - inspector-network
+
 networks:
   data-stack-network:
+    driver: bridge
+  inspector-network:
     driver: bridge
